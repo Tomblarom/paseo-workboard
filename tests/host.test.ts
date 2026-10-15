@@ -7,7 +7,8 @@ import type {
 import { allPages, PaseoHost } from "../server/host";
 import type { TimelineReader } from "../server/conversations";
 import type { PaseoCompat } from "../server/paseo-compat";
-import { workspace } from "./fixtures";
+import { fixture, workspace } from "./fixtures";
+import { Workboard } from "../server/workboard";
 
 it("reads every page and rejects a cursor loop instead of silently truncating", async () => {
   expect(
@@ -205,6 +206,64 @@ const parentAgent = {
   requiresAttention: false,
 };
 
+it("builds and refreshes the board without hydrating closed provider sessions", async () => {
+  const subagents = vi.fn(async () => []);
+  const timeline = vi.fn<TimelineReader>();
+  const host = providerHost(
+    {
+      ...parentAgent,
+      status: "closed",
+      lastUserMessageAt: "2026-08-01T00:00:00.000Z",
+    },
+    { subagents } as unknown as PaseoCompat,
+    vi.fn(),
+    [],
+    timeline,
+  );
+  const board = new Workboard(host, fixture().store, () =>
+    Date.parse("2026-08-04T00:00:00Z"),
+  );
+  try {
+    await board.start();
+    await board.refresh();
+    expect(board.snapshot().connected).toBe(true);
+    expect(board.snapshot().cards).toHaveLength(1);
+    for (let pass = 0; pass < 2; pass++) {
+      const parent = (await host.inventory()).agents[0];
+      expect(
+        await host.conversation(parent, Date.parse("2026-08-04T00:00:00Z")),
+      ).toEqual({
+        displayAt: "2026-08-01T00:00:00.000Z",
+        display: "lower-bound",
+        gateAt: parentAgent.updatedAt,
+        gate: "upper-bound",
+        reason: null,
+      });
+    }
+    expect(subagents).not.toHaveBeenCalled();
+    expect(timeline).not.toHaveBeenCalled();
+  } finally {
+    board.dispose();
+  }
+});
+
+it("enumerates provider children only for explicitly selected archive candidates", async () => {
+  const subagents = vi.fn(async () => []);
+  const host = providerHost({ ...parentAgent, status: "closed" }, {
+    subagents,
+  } as unknown as PaseoCompat);
+  try {
+    await host.inventory({ verifyWorkspaceIds: ["other-workspace"] });
+    expect(subagents).not.toHaveBeenCalled();
+    await host.inventory({ verifyWorkspaceIds: ["w1"] });
+    expect(subagents).toHaveBeenCalledExactlyOnceWith("parent");
+    await host.inventory();
+    expect(subagents).toHaveBeenCalledTimes(1);
+  } finally {
+    host.dispose();
+  }
+});
+
 it("does not restore provider sessions outside active workspaces", async () => {
   const subagents = vi.fn(async () => []);
   const host = providerHost(
@@ -330,13 +389,15 @@ it("keeps a projected child whose row is newer than its descriptor unknown", asy
   } as unknown as PaseoCompat;
   const host = providerHost(parentAgent, compat);
   try {
-    const child = (await host.inventory()).agents.find(
-      (agent) => agent.id === "parent/provider/child",
-    );
+    const child = (
+      await host.inventory({ verifyWorkspaceIds: ["w1"] })
+    ).agents.find((agent) => agent.id === "parent/provider/child");
     // The stamped row is neither activity nor a conversation time, and a child descriptor
     // never bounds the archive gate.
     expect(
-      await host.conversation(child!, Date.parse("2026-08-05T00:00:00.000Z")),
+      await host.conversation(child!, Date.parse("2026-08-05T00:00:00.000Z"), {
+        verifyTimeline: true,
+      }),
     ).toEqual({
       displayAt: null,
       display: "unknown",
@@ -372,9 +433,9 @@ it("keeps a parent readable when its provider children cannot be listed", async 
   } as unknown as PaseoCompat;
   const host = providerHost(parentAgent, compat, vi.fn(), [], read);
   try {
-    const parent = (await host.inventory()).agents.find(
-      (agent) => agent.id === "parent",
-    );
+    const parent = (
+      await host.inventory({ verifyWorkspaceIds: ["w1"] })
+    ).agents.find((agent) => agent.id === "parent");
     expect(parent?.childEnumeration).toBe("unavailable");
     expect(compat.subagents).toHaveBeenCalledTimes(1);
     await host.inventory();
@@ -383,6 +444,7 @@ it("keeps a parent readable when its provider children cannot be listed", async 
     const evidence = await host.conversation(
       parent!,
       Date.parse("2026-08-04T00:00:00.000Z"),
+      { verifyTimeline: true },
     );
     expect(evidence.display).toBe("exact");
     expect(evidence.displayAt).toBe("2026-08-02T00:00:00.000Z");
@@ -442,7 +504,7 @@ it("keeps an archived parent off the periodic timeline path", async () => {
     const candidate = await host.conversation(
       parent!,
       Date.parse("2026-08-04T00:00:00.000Z"),
-      { archivedTimeline: true },
+      { verifyTimeline: true },
     );
     expect(read).toHaveBeenCalled();
     expect(candidate.display).toBe("exact");
@@ -483,6 +545,7 @@ it("never labels a lower bound exact when the recorded user message is missing",
     const evidence = await host.conversation(
       parent!,
       Date.parse("2026-08-04T00:00:00.000Z"),
+      { verifyTimeline: true },
     );
     // The record says a user message exists that this timeline does not show.
     expect(evidence).toEqual({

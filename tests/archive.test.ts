@@ -38,6 +38,33 @@ it("archives on cold start without any UI and keeps the original conversation cl
     board.dispose();
   }
 });
+it("verifies only due workspaces and keeps timeline reads in the archive recheck", async () => {
+  const { board, host, inventory } = dueFixture();
+  inventory.workspaces.push(workspace("inbox"));
+  const reads = vi.spyOn(host, "inventory");
+  const conversations = vi.spyOn(host, "conversation");
+  try {
+    await board.start();
+    expect(host.archive).toHaveBeenCalledExactlyOnceWith("old");
+    const verified = reads.mock.calls.filter(
+      ([options]) => options?.verifyWorkspaceIds,
+    );
+    expect(verified).toEqual([
+      [{ verifyWorkspaceIds: ["old"] }],
+      [{ verifyWorkspaceIds: ["old"] }],
+    ]);
+    expect(
+      conversations.mock.calls.some(([, , options]) => options?.verifyTimeline),
+    ).toBe(true);
+    expect(
+      conversations.mock.calls
+        .filter(([, , options]) => options?.verifyTimeline)
+        .map(([agent]) => agent.workspaceId),
+    ).toEqual(["old"]);
+  } finally {
+    board.dispose();
+  }
+});
 it("periodic work strictly crosses 30 days, includes archived Agents, and stops after dispose", async () => {
   vi.useFakeTimers();
   const test = dueFixture();
@@ -454,9 +481,7 @@ it("defers an unknown verification timeline and retries after the deadline", asy
   let clock = test.now();
   const board = new Workboard(test.host, test.store, () => clock);
   test.host.conversation = vi.fn(async (_agent, _now, options) =>
-    options?.archivedTimeline
-      ? observed(null)
-      : observed("2026-08-01T00:00:00Z"),
+    options?.verifyTimeline ? observed(null) : observed("2026-08-01T00:00:00Z"),
   );
   try {
     await board.start();

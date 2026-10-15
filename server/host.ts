@@ -65,6 +65,8 @@ export type Agent = Pick<
   | "archivedAt"
 > & {
   activity: Card["activity"];
+  /** Only an already-loaded runtime may be read by ordinary reconciliation. */
+  runtimeLoaded?: boolean;
   parentAgentId?: string;
   subagentId?: string;
   /** Whether this parent's provider children could be listed in this inventory. */
@@ -88,12 +90,14 @@ export interface Inventory {
 }
 export interface Host {
   identity: { serverId: string; version: string };
-  inventory(): Promise<Inventory>;
+  inventory(options?: {
+    verifyWorkspaceIds?: readonly string[];
+  }): Promise<Inventory>;
   workspace(id: string): Promise<Workspace | null>;
   conversation(
     agent: Agent,
     now: number,
-    options?: { archivedTimeline?: boolean },
+    options?: { verifyTimeline?: boolean },
   ): Promise<ConversationEvidence>;
   setLabel(
     workspaceId: string,
@@ -202,6 +206,8 @@ export class PaseoHost implements Host {
         this.agentUpdates.set(change.agent.id, {
           ...change.agent,
           activity: activity(change.agent),
+          runtimeLoaded:
+            !change.agent.archivedAt && change.agent.status !== "closed",
         });
         this.changed(change.agent.workspaceId);
       } else {
@@ -223,7 +229,9 @@ export class PaseoHost implements Host {
       this.changed(this.agentWorkspaces.get(parentAgentId));
     }
   }
-  async inventory(): Promise<Inventory> {
+  async inventory(
+    options: { verifyWorkspaceIds?: readonly string[] } = {},
+  ): Promise<Inventory> {
     if (this.disposed) throw new Error("Workboard stopped");
     this.workspaceUpdates.clear();
     this.agentUpdates.clear();
@@ -283,7 +291,11 @@ export class PaseoHost implements Host {
     const agentMap = new Map<string, Agent>(
       agents.map(({ agent }) => [
         agent.id,
-        { ...agent, activity: activity(agent) },
+        {
+          ...agent,
+          activity: activity(agent),
+          runtimeLoaded: !agent.archivedAt && agent.status !== "closed",
+        },
       ]),
     );
     for (const [id, value] of this.workspaceUpdates) {
@@ -301,10 +313,14 @@ export class PaseoHost implements Host {
       )
         agentMap.set(id, value);
     }
+    const verifyWorkspaceIds = new Set(options.verifyWorkspaceIds ?? []);
     for (const agent of [...agentMap.values()]) {
       this.agentWorkspaces.set(agent.id, agent.workspaceId);
       if (!agent.workspaceId || !workspaceMap.has(agent.workspaceId)) continue;
-      const record = await this.childRecord(agent);
+      const record = await this.childRecord(
+        agent,
+        verifyWorkspaceIds.has(agent.workspaceId),
+      );
       agent.childEnumeration = record.refused
         ? agent.archivedAt
           ? "refused"
@@ -319,6 +335,7 @@ export class PaseoHost implements Host {
           title: child.title,
           updatedAt: child.updatedAt,
           lastUserMessageAt: null,
+          runtimeLoaded: agent.runtimeLoaded,
           activity:
             child.status === "running"
               ? "running"
@@ -340,12 +357,24 @@ export class PaseoHost implements Host {
   }
   /**
    * Provider children are cached per parent activity. Re-listing them costs the daemon one
-   * request per agent on every pass, and an archived parent cannot be re-listed at all, so
-   * the children observed while it was live are kept instead of its chat going unknown.
+   * request per agent on every pass and can start a sleeping provider runtime. Only an
+   * already-loaded parent or explicit archive candidate may enumerate them. Ordinary
+   * inventories reuse cached children for sleeping parents and never claim completeness.
    */
-  private async childRecord(agent: Agent): Promise<ChildRecord> {
+  private async childRecord(
+    agent: Agent,
+    verify: boolean,
+  ): Promise<ChildRecord> {
     const cached = this.childRecords.get(agent.id);
     if (cached && cached.parentUpdatedAt === agent.updatedAt) return cached;
+    // Do not cache a skipped read: a later archive check still needs to enumerate it.
+    if (!verify && !agent.runtimeLoaded && !agent.archivedAt)
+      return {
+        parentUpdatedAt: agent.updatedAt,
+        seenWhileLive: false,
+        children: cached?.children ?? [],
+        refused: true,
+      };
     let record: ChildRecord;
     if (agent.archivedAt) {
       record = {
@@ -379,14 +408,13 @@ export class PaseoHost implements Host {
     return value ? normalize(value) : null;
   }
   /**
-   * Read one agent's conversation evidence. `archivedTimeline` is opt-in because Paseo
-   * re-projects an archived agent's whole history on every read (7.2-19.3s for pi), which
-   * must not sit in the periodic refresh path; only the archive recheck asks for it.
+   * Timeline reads can restore a provider runtime, including its MCP processes. Keep the
+   * sleeping agents on recorded bounds; only an explicit archive recheck restores them.
    */
   async conversation(
     agent: Agent,
     now: number,
-    options: { archivedTimeline?: boolean } = {},
+    options: { verifyTimeline?: boolean } = {},
   ): Promise<ConversationEvidence> {
     const isChild = Boolean(agent.parentAgentId && agent.subagentId);
     const parse = (value: string | null | undefined): number | null => {
@@ -434,7 +462,7 @@ export class PaseoHost implements Host {
         reason,
       };
     };
-    if (agent.archivedAt && !options.archivedTimeline)
+    if (!options.verifyTimeline && (!agent.runtimeLoaded || agent.archivedAt))
       return evidenceFor(recordedLower, null);
     let window: ConversationWindow;
     try {

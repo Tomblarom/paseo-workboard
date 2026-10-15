@@ -449,7 +449,7 @@ export class Workboard {
     agents: readonly Agent[],
     previous: Task | undefined,
     now: number,
-    options: { archivedTimeline?: boolean } = {},
+    options: { verifyTimeline?: boolean } = {},
   ): Promise<WorkspaceConversation> {
     const readings: Array<{
       agent: Agent;
@@ -586,10 +586,10 @@ export class Workboard {
   ): Promise<string | null> {
     let gate: number | null = null;
     try {
-      // The archive candidate is the one place that pays for an archived agent's timeline,
-      // and a vanished child without a recorded time already forces an unknown gate.
+      // Only archive candidates pay for timeline reads that may restore a provider runtime;
+      // a vanished child without a recorded time already forces an unknown gate.
       const evidence = await this.observe(agents, candidate, this.now(), {
-        archivedTimeline: true,
+        verifyTimeline: true,
       });
       const at = archiveGate({
         conversationGateAt: evidence.gateAt,
@@ -1425,7 +1425,9 @@ export class Workboard {
     const epochs = new Map(
       candidates.map((task) => [task.id, this.observation(task.workspaceId!)]),
     );
-    const inventory = await this.host.inventory();
+    const inventory = await this.host.inventory({
+      verifyWorkspaceIds: candidates.map((task) => task.workspaceId!),
+    });
     for (const candidate of candidates) {
       if (this.stopped || this.pendingMutations > 0) return;
       const id = candidate.workspaceId!;
@@ -1514,7 +1516,7 @@ export class Workboard {
       // Storage and safety checks can take time. Re-read membership, labels and Agent state before sending.
       let finalIssue: string | null = null;
       try {
-        const fresh = await this.host.inventory();
+        const fresh = await this.host.inventory({ verifyWorkspaceIds: [id] });
         const current = fresh.workspaces.find((w) => w.id === id);
         const currentAgents = fresh.agents.filter((a) => a.workspaceId === id);
         const fingerprint = (items: typeof agents) =>

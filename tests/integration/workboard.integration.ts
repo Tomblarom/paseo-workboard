@@ -83,6 +83,78 @@ async function readyBoard(): Promise<Board> {
   }
   throw new Error(`Workboard did not become ready: ${String(failure)}`);
 }
+
+// Runtime close has no SDK method. Use the isolated daemon's MCP tool so the
+// test retains an unarchived chat whose provider session is no longer loaded.
+async function closeFixtureRuntime(agentId: string): Promise<void> {
+  const daemon = await status();
+  if (
+    (await realpath(daemon.home)) !== home ||
+    !/^127\.0\.0\.1:\d+$/.test(daemon.listen)
+  )
+    throw new Error("Refusing MCP access outside the isolated daemon");
+  const url = `http://${daemon.listen}/mcp/agents`;
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json, text/event-stream",
+  };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  let id = 0;
+  async function request(method: string, params: unknown): Promise<void> {
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ jsonrpc: "2.0", id: ++id, method, params }),
+      signal: controller.signal,
+    });
+    if (!response.ok)
+      throw new Error(`Isolated MCP request failed: ${response.status}`);
+    const sessionId = response.headers.get("mcp-session-id");
+    if (sessionId) headers["mcp-session-id"] = sessionId;
+    const text = await response.text();
+    const data =
+      text
+        .split("\n")
+        .find((line) => line.startsWith("data: "))
+        ?.slice(6) ?? text;
+    const reply = JSON.parse(data) as {
+      error?: unknown;
+      result?: { isError?: boolean };
+    };
+    if (reply.error || reply.result?.isError)
+      throw new Error("Isolated MCP tool failed");
+  }
+  try {
+    await request("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "workboard-integration", version: "1" },
+    });
+    const initialized = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+      }),
+      signal: controller.signal,
+    });
+    if (!initialized.ok) throw new Error("Isolated MCP initialization failed");
+    await request("tools/call", { name: "kill_agent", arguments: { agentId } });
+  } finally {
+    try {
+      if (headers["mcp-session-id"])
+        await fetch(url, {
+          method: "DELETE",
+          headers,
+          signal: controller.signal,
+        });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
 async function eventually<T>(
   read: () => Promise<T>,
   matches: (value: T) => boolean,
@@ -159,6 +231,48 @@ afterAll(async () => {
 });
 
 describe("isolated Paseo workboard", () => {
+  test("cold start and refresh leave a closed provider runtime asleep", async () => {
+    const directory = path.join(home, "integration-sleeping-agent");
+    await mkdir(directory, { recursive: true });
+    const workspace = await client.createWorkspace({
+      source: { kind: "directory", path: directory },
+      title: "integration sleeping agent",
+    });
+    const workspaceId = workspace.workspace?.id;
+    if (!workspaceId) throw new Error("Fixture workspace was not created");
+    try {
+      const agent = await client.createAgent({
+        provider: fixtureId,
+        model: "fixture-model",
+        cwd: directory,
+        workspaceId,
+      });
+      await closeFixtureRuntime(agent.id);
+      expect((await client.fetchAgent(agent.id))?.agent.status).toBe("closed");
+      await client.reloadPlugin(pluginId);
+      const board = await readyBoard();
+      expect(
+        board.cards.find((card) => card.workspaceId === workspaceId),
+      ).toBeDefined();
+      await client.setWorkspaceLabel({
+        workspaceId,
+        label: { name: "task:done", color: "emerald" },
+        assigned: true,
+      });
+      await eventually(
+        snapshot,
+        (value) =>
+          value.cards.some(
+            (card) => card.workspaceId === workspaceId && card.stage === "done",
+          ),
+        "native label refresh was not reflected",
+      );
+      expect((await client.fetchAgent(agent.id))?.agent.status).toBe("closed");
+    } finally {
+      await client.archiveWorkspace(workspaceId);
+    }
+  });
+
   test("persists custom groups, follows native labels and deletes only after tasks move out", async () => {
     const initial = await readyBoard();
     const stamp = Date.now();

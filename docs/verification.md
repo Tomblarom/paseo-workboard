@@ -8,6 +8,19 @@ tested.
 
 ## Verified baseline
 
+On 2026-10-15, the closed-runtime refresh fix passed TypeScript, **401 unit
+tests in 28 files**, formatting and package checks on Linux x64 with Node
+24.21.0. A fresh marked Paseo **0.11.2** home passed **14/14 integration tests**
+in 40.81s using the source-directory installation. The added test closes a
+fixture runtime through the isolated daemon's MCP tool, then verifies that
+both plugin reload and a native-label refresh leave it closed. Existing
+automatic-archive and managed-worktree checks still pass. The temporary
+daemon was stopped; the shared daemon was not changed.
+
+This is not a memory benchmark or an atomic no-hydration guarantee: the SDK
+does not prevent a concurrent close between inventory and a timeline or
+child-list read. Explicit archive verification may still restore a candidate.
+
 On 2026-10-13, the dual-view source (still schema v8) was checked on macOS arm64 with
 Node 22.22.2 through `mise`.
 
